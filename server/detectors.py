@@ -11,7 +11,6 @@ import numpy as np
 from models_loader import get_coco_model, get_fall_model, get_fire_smoke_model
 
 PERSON_CLASS = 0  # COCO
-VEHICLE_CLASSES = {2, 3, 5, 7}  # car, motorcycle, bus, truck
 CONF = 0.25
 FIRE_SMOKE_CONF = 0.15
 FIRE_HSV_MIN_AREA = 180
@@ -227,14 +226,21 @@ def detect_fall(image: np.ndarray) -> List[Dict[str, Any]]:
     return dets
 
 
+def _is_correct_direction(dx: float, dy: float, correct_direction: str) -> bool:
+    direction = correct_direction if correct_direction in VALID_DIRECTIONS else "down"
+    if direction == "down":
+        return dy > WRONG_WAY_MIN_MOVE
+    if direction == "up":
+        return dy < -WRONG_WAY_MIN_MOVE
+    if direction == "right":
+        return dx > WRONG_WAY_MIN_MOVE
+    if direction == "left":
+        return dx < -WRONG_WAY_MIN_MOVE
+    return False
+
+
 def _is_wrong_direction(dx: float, dy: float, correct_direction: str) -> bool:
-    """
-    correct_direction = allowed traffic flow in the camera frame.
-      down  : top -> bottom
-      up    : bottom -> top
-      right : left -> right
-      left  : right -> left
-    """
+    """Opposite of correct flow; tiny jitter returns False (unknown)."""
     direction = correct_direction if correct_direction in VALID_DIRECTIONS else "down"
     if direction == "down":
         return dy < -WRONG_WAY_MIN_MOVE
@@ -247,53 +253,84 @@ def _is_wrong_direction(dx: float, dy: float, correct_direction: str) -> bool:
     return False
 
 
-def _track_vehicles_wrong_way(
-    vehicles: List[Dict[str, Any]], session_id: str, correct_direction: str
+def _track_direction(
+    items: List[Dict[str, Any]], session_id: str, correct_direction: str
 ) -> bool:
-    wrong = False
+    """
+    Match centroids across frames.
+    Sets item['_status'] to ok | wrong | unknown.
+    Returns True if any wrong-way.
+    """
+    any_wrong = False
     with _session_lock:
         prev = _sessions.get(session_id, [])
         matched_prev: List[Dict[str, float]] = []
-        for veh in vehicles:
+        for item in items:
             best: Optional[Dict[str, float]] = None
             best_dist = WRONG_WAY_MATCH_DIST
             for p in prev:
-                dist = ((veh["_cx"] - p["cx"]) ** 2 + (veh["_cy"] - p["cy"]) ** 2) ** 0.5
+                dist = ((item["_cx"] - p["cx"]) ** 2 + (item["_cy"] - p["cy"]) ** 2) ** 0.5
                 if dist < best_dist:
                     best_dist = dist
                     best = p
+            status = "unknown"
             if best is not None:
-                dx = veh["_cx"] - best["cx"]
-                dy = veh["_cy"] - best["cy"]
+                dx = item["_cx"] - best["cx"]
+                dy = item["_cy"] - best["cy"]
                 if _is_wrong_direction(dx, dy, correct_direction):
-                    wrong = True
-                    veh["label"] = f"{veh['label']}:wrong_way"
-            matched_prev.append({"cx": veh["_cx"], "cy": veh["_cy"]})
+                    status = "wrong"
+                    any_wrong = True
+                elif _is_correct_direction(dx, dy, correct_direction):
+                    status = "ok"
+            item["_status"] = status
+            matched_prev.append({"cx": item["_cx"], "cy": item["_cy"]})
         _sessions[session_id] = matched_prev
-    return wrong
+    return any_wrong
+
+
+def _pack_direction_dets(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out = []
+    for v in items:
+        status = v.get("_status", "unknown")
+        if status == "wrong":
+            label = "غلط"
+            model = "wrong_way"
+        elif status == "ok":
+            label = "صح"
+            model = "ok_way"
+        else:
+            label = "تتبع"
+            model = "tracking"
+        out.append(
+            {
+                "model": model,
+                "label": label,
+                "score": v["score"],
+                "box": v["box"],
+                "status": status,
+            }
+        )
+    return out
 
 
 def detect_wrong_way(
     image: np.ndarray, session_id: str, correct_direction: str = "down"
 ) -> Tuple[List[Dict[str, Any]], bool]:
+    """Track people walking direction against the chosen correct way."""
     model = get_coco_model()
     result = model.predict(source=image, conf=CONF, verbose=False)[0]
     current: List[Dict[str, Any]] = []
-    names = result.names or {}
     if result.boxes is not None and len(result.boxes) > 0:
         xyxy = result.boxes.xyxy.cpu().numpy()
         confs = result.boxes.conf.cpu().numpy()
         clss = result.boxes.cls.cpu().numpy().astype(int)
         for box, conf, cls_id in zip(xyxy, confs, clss):
-            if int(cls_id) not in VEHICLE_CLASSES:
+            if int(cls_id) != PERSON_CLASS:
                 continue
-            label = str(names.get(int(cls_id), cls_id))
             x1, y1, x2, y2 = [float(v) for v in box]
             cx, cy = _centroid([x1, y1, x2, y2])
             current.append(
                 {
-                    "model": "wrong_way",
-                    "label": label,
                     "score": float(conf),
                     "box": [x1, y1, x2, y2],
                     "_cx": cx,
@@ -301,17 +338,8 @@ def detect_wrong_way(
                 }
             )
 
-    wrong = _track_vehicles_wrong_way(current, session_id, correct_direction)
-    clean = [
-        {
-            "model": "wrong_way",
-            "label": v["label"],
-            "score": v["score"],
-            "box": v["box"],
-        }
-        for v in current
-    ]
-    return clean, wrong
+    wrong = _track_direction(current, session_id, correct_direction)
+    return _pack_direction_dets(current), wrong
 
 
 def run_enabled(
@@ -331,60 +359,45 @@ def run_enabled(
     want_fall = "fall" in enabled
     want_wrong = "wrong_way" in enabled
 
-    if want_people and want_wrong:
+    # Shared COCO pass when people count and/or direction tracking need persons
+    if want_people or want_wrong:
         model = get_coco_model()
         result = model.predict(source=image, conf=CONF, verbose=False)[0]
         names = result.names or {}
-        vehicles_for_track: List[Dict[str, Any]] = []
+        people_for_track: List[Dict[str, Any]] = []
         if result.boxes is not None and len(result.boxes) > 0:
             xyxy = result.boxes.xyxy.cpu().numpy()
             confs = result.boxes.conf.cpu().numpy()
             clss = result.boxes.cls.cpu().numpy().astype(int)
             for box, conf, cls_id in zip(xyxy, confs, clss):
                 cls_id = int(cls_id)
+                if cls_id != PERSON_CLASS:
+                    continue
                 x1, y1, x2, y2 = [float(v) for v in box]
-                label = str(names.get(cls_id, cls_id))
-                if cls_id == PERSON_CLASS:
+                cx, cy = _centroid([x1, y1, x2, y2])
+                if want_people:
                     detections.append(
                         {
                             "model": "people",
-                            "label": label,
+                            "label": str(names.get(cls_id, "person")),
                             "score": float(conf),
                             "box": [x1, y1, x2, y2],
                         }
                     )
-                elif cls_id in VEHICLE_CLASSES:
-                    cx, cy = _centroid([x1, y1, x2, y2])
-                    vehicles_for_track.append(
+                if want_wrong:
+                    people_for_track.append(
                         {
-                            "model": "wrong_way",
-                            "label": label,
                             "score": float(conf),
                             "box": [x1, y1, x2, y2],
                             "_cx": cx,
                             "_cy": cy,
                         }
                     )
-        people_count = sum(1 for d in detections if d["model"] == "people")
-        wrong = _track_vehicles_wrong_way(vehicles_for_track, session_id, direction)
-        for v in vehicles_for_track:
-            detections.append(
-                {
-                    "model": "wrong_way",
-                    "label": v["label"],
-                    "score": v["score"],
-                    "box": v["box"],
-                }
-            )
-        if wrong:
-            alerts.append("wrong_way")
-    else:
         if want_people:
-            people_dets, people_count = detect_people(image)
-            detections.extend(people_dets)
+            people_count = sum(1 for d in detections if d["model"] == "people")
         if want_wrong:
-            ww_dets, wrong = detect_wrong_way(image, session_id, direction)
-            detections.extend(ww_dets)
+            wrong = _track_direction(people_for_track, session_id, direction)
+            detections.extend(_pack_direction_dets(people_for_track))
             if wrong:
                 alerts.append("wrong_way")
 

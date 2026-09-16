@@ -109,19 +109,22 @@ body {
 
 .direction-picker {
   margin-top: 14px;
-  padding: 14px;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  background: rgba(21, 42, 69, 0.55);
+  padding: 16px;
+  border: 1px solid rgba(234, 179, 8, 0.28);
+  border-radius: 14px;
+  background:
+    linear-gradient(145deg, rgba(234, 179, 8, 0.08), transparent 55%),
+    rgba(12, 28, 48, 0.9);
 }
 
 .direction-picker h3 {
   margin: 0 0 4px;
   font-size: 0.95rem;
+  color: #fde68a;
 }
 
 .direction-hint {
-  margin: 0 0 10px;
+  margin: 0 0 12px;
   color: var(--muted);
   font-size: 0.85rem;
 }
@@ -129,7 +132,7 @@ body {
 .direction-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 8px;
+  gap: 10px;
 }
 
 @media (max-width: 640px) {
@@ -139,21 +142,53 @@ body {
 }
 
 .direction-btn {
-  font: inherit;
-  padding: 10px 8px;
-  border-radius: 10px;
-  border: 1px solid var(--line);
-  background: transparent;
-  color: var(--text);
+  appearance: none;
+  -webkit-appearance: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-height: 72px;
+  padding: 12px 8px;
+  border-radius: 14px;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  background: rgba(15, 35, 58, 0.95);
+  color: #e8eef7;
   cursor: pointer;
+  font: inherit;
   transition:
-    border-color 0.2s,
-    background 0.2s;
+    border-color 0.2s ease,
+    background 0.2s ease,
+    transform 0.15s ease,
+    box-shadow 0.2s ease;
+}
+
+.direction-btn:hover {
+  transform: translateY(-2px);
+  border-color: rgba(234, 179, 8, 0.55);
 }
 
 .direction-btn.on {
   border-color: #eab308;
-  background: rgba(234, 179, 8, 0.18);
+  background: linear-gradient(180deg, rgba(234, 179, 8, 0.28), rgba(234, 179, 8, 0.1));
+  box-shadow:
+    0 0 0 1px rgba(234, 179, 8, 0.35),
+    0 8px 20px rgba(234, 179, 8, 0.12);
+}
+
+.direction-arrow {
+  font-size: 1.45rem;
+  line-height: 1;
+  color: #fde68a;
+}
+
+.direction-btn.on .direction-arrow {
+  color: #facc15;
+}
+
+.direction-label {
+  font-size: 0.9rem;
   font-weight: 600;
 }
 

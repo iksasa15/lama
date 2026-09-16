@@ -6,17 +6,32 @@ const MODELS = [
   { id: 'smoke', label: 'كشف الدخان', color: '#94a3b8' },
   { id: 'fire', label: 'كشف الحريق', color: '#f97316' },
   { id: 'fall', label: 'سقوط / طوارئ', color: '#ef4444' },
-  { id: 'wrong_way', label: 'عكس السير', color: '#eab308' },
+  { id: 'wrong_way', label: 'اتجاه الأشخاص', color: '#eab308' },
 ]
 
 const DIRECTIONS = [
-  { id: 'up', label: '↑ أعلى', hint: 'من الأسفل إلى الأعلى' },
-  { id: 'down', label: '↓ أسفل', hint: 'من الأعلى إلى الأسفل' },
-  { id: 'left', label: '← يسار', hint: 'من اليمين إلى اليسار' },
-  { id: 'right', label: '→ يمين', hint: 'من اليسار إلى اليمين' },
+  { id: 'up', arrow: '↑', label: 'أعلى' },
+  { id: 'down', arrow: '↓', label: 'أسفل' },
+  { id: 'left', arrow: '←', label: 'يسار' },
+  { id: 'right', arrow: '→', label: 'يمين' },
 ]
 
-const COLOR_BY_MODEL = Object.fromEntries(MODELS.map((m) => [m.id, m.color]))
+const COLOR_BY_MODEL = {
+  people: '#2dd4bf',
+  smoke: '#94a3b8',
+  fire: '#f97316',
+  fall: '#ef4444',
+  wrong_way: '#ef4444',
+  ok_way: '#22c55e',
+  tracking: '#eab308',
+}
+
+function boxColor(d) {
+  if (d.status === 'ok' || d.model === 'ok_way' || d.label === 'صح') return '#22c55e'
+  if (d.status === 'wrong' || d.model === 'wrong_way' || d.label === 'غلط') return '#ef4444'
+  if (d.status === 'unknown' || d.model === 'tracking') return '#eab308'
+  return COLOR_BY_MODEL[d.model] || '#38bdf8'
+}
 
 function createSessionId() {
   return `sess-${Math.random().toString(36).slice(2, 10)}`
@@ -75,17 +90,17 @@ export default function App() {
     ctx.clearRect(0, 0, width, height)
     for (const d of dets) {
       const [x1, y1, x2, y2] = d.box
-      const color = COLOR_BY_MODEL[d.model] || '#38bdf8'
+      const color = boxColor(d)
       ctx.strokeStyle = color
-      ctx.lineWidth = 2
+      ctx.lineWidth = d.status === 'wrong' || d.label === 'غلط' ? 3 : 2
       ctx.strokeRect(x1, y1, x2 - x1, y2 - y1)
       const text = `${d.label} ${(d.score * 100).toFixed(0)}%`
       ctx.font = '14px "IBM Plex Sans Arabic", "Segoe UI", sans-serif'
       const tw = ctx.measureText(text).width
       ctx.fillStyle = color
-      ctx.fillRect(x1, Math.max(0, y1 - 20), tw + 8, 20)
-      ctx.fillStyle = '#0b1220'
-      ctx.fillText(text, x1 + 4, Math.max(14, y1 - 5))
+      ctx.fillRect(x1, Math.max(0, y1 - 22), tw + 10, 22)
+      ctx.fillStyle = '#041018'
+      ctx.fillText(text, x1 + 5, Math.max(15, y1 - 6))
     }
   }, [])
 
@@ -279,9 +294,9 @@ export default function App() {
         </div>
         {enabled.wrong_way && (
           <div className="direction-picker">
-            <h3>اتجاه السير الصحيح</h3>
+            <h3>اتجاه المشي الصحيح</h3>
             <p className="direction-hint">
-              اختر اتجاه الحركة المسموح في الكاميرا — أي مركبة عكسه تُنبَّه
+              يتتبع الأشخاص: أخضر = صح · أحمر = غلط · أصفر = يتتبع
             </p>
             <div className="direction-grid">
               {DIRECTIONS.map((d) => (
@@ -289,10 +304,10 @@ export default function App() {
                   key={d.id}
                   type="button"
                   className={`direction-btn ${correctDirection === d.id ? 'on' : ''}`}
-                  title={d.hint}
                   onClick={() => setCorrectDirection(d.id)}
                 >
-                  {d.label}
+                  <span className="direction-arrow">{d.arrow}</span>
+                  <span className="direction-label">{d.label}</span>
                 </button>
               ))}
             </div>
@@ -371,7 +386,7 @@ export default function App() {
                     {a === 'fire' && 'حريق'}
                     {a === 'smoke' && 'دخان'}
                     {a === 'fall' && 'سقوط'}
-                    {a === 'wrong_way' && 'عكس السير'}
+                    {a === 'wrong_way' && 'شخص عكس الاتجاه'}
                   </li>
                 ))}
               </ul>
@@ -384,7 +399,7 @@ export default function App() {
                 <li key={`${d.label}-${i}`}>
                   <span
                     className="chip"
-                    style={{ background: COLOR_BY_MODEL[d.model] || '#64748b' }}
+                    style={{ background: boxColor(d) }}
                   />
                   {d.label} — {(d.score * 100).toFixed(0)}%
                 </li>
