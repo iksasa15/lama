@@ -60,6 +60,7 @@ def preload_models() -> None:
     """Warm caches in background so first UI click is faster."""
     try:
         get_coco_model()
+        print("[preload] coco ready")
     except Exception as exc:  # noqa: BLE001
         print(f"[preload] coco failed: {exc}")
     try:
@@ -67,3 +68,8 @@ def preload_models() -> None:
         print("[preload] fire/smoke ready")
     except Exception as exc:  # noqa: BLE001
         print(f"[preload] fire/smoke failed: {exc}")
+    try:
+        get_fall_model()
+        print("[preload] fall ready")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[preload] fall failed: {exc}")

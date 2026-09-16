@@ -27,10 +27,28 @@ const COLOR_BY_MODEL = {
 }
 
 function boxColor(d) {
-  if (d.status === 'ok' || d.model === 'ok_way' || d.label === 'صح') return '#22c55e'
-  if (d.status === 'wrong' || d.model === 'wrong_way' || d.label === 'غلط') return '#ef4444'
-  if (d.status === 'unknown' || d.model === 'tracking') return '#eab308'
+  if (d.status === 'ok' || d.model === 'ok_way' || d.label === 'صح' || d.label === 'OK') return '#22c55e'
+  if (d.status === 'wrong' || d.model === 'wrong_way' || d.label === 'غلط' || d.label === 'Wrong way') return '#ef4444'
+  if (d.status === 'unknown' || d.model === 'tracking' || d.label === 'تتبع' || d.label === 'Tracking') return '#eab308'
+  if (d.label === 'fallen' || d.label === 'Fallen') return '#ef4444'
+  if (d.label === 'sitting' || d.label === 'Sitting') return '#f59e0b'
+  if (d.label === 'standing' || d.label === 'Standing') return '#22c55e'
   return COLOR_BY_MODEL[d.model] || '#38bdf8'
+}
+
+function displayLabel(d) {
+  const map = {
+    fallen: 'Fallen',
+    sitting: 'Sitting',
+    standing: 'Standing',
+    fire: 'Fire',
+    smoke: 'Smoke',
+    person: 'Person',
+    صح: 'OK',
+    غلط: 'Wrong way',
+    تتبع: 'Tracking',
+  }
+  return map[d.label] || d.label
 }
 
 function createSessionId() {
@@ -94,7 +112,7 @@ export default function App() {
       ctx.strokeStyle = color
       ctx.lineWidth = d.status === 'wrong' || d.label === 'غلط' ? 3 : 2
       ctx.strokeRect(x1, y1, x2 - x1, y2 - y1)
-      const text = `${d.label} ${(d.score * 100).toFixed(0)}%`
+      const text = `${displayLabel(d)} ${(d.score * 100).toFixed(0)}%`
       ctx.font = '14px "IBM Plex Sans Arabic", "Segoe UI", sans-serif'
       const tw = ctx.measureText(text).width
       ctx.fillStyle = color
@@ -401,7 +419,7 @@ export default function App() {
                     className="chip"
                     style={{ background: boxColor(d) }}
                   />
-                  {d.label} — {(d.score * 100).toFixed(0)}%
+                  {displayLabel(d)} — {(d.score * 100).toFixed(0)}%
                 </li>
               ))}
             </ul>

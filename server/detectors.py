@@ -12,13 +12,22 @@ from models_loader import get_coco_model, get_fall_model, get_fire_smoke_model
 
 PERSON_CLASS = 0  # COCO
 CONF = 0.25
+PERSON_CONF = 0.08  # lower for dense crowds
+PERSON_IMGSZ = 960
+PERSON_MAX_DET = 300
 FIRE_SMOKE_CONF = 0.15
+FALL_CONF = 0.12
+# Person bbox wider than tall → likely lying / fallen (assist)
+FALL_ASPECT_MIN = 1.25
+FALL_ASPECT_MAX_H_RATIO = 0.55  # fallen person usually not full frame height
 FIRE_HSV_MIN_AREA = 180
 FIRE_HSV_MAX_AREA_RATIO = 0.035
 SMOKE_HSV_MIN_AREA_RATIO = 0.03
 
-WRONG_WAY_MIN_MOVE = 8.0
-WRONG_WAY_MATCH_DIST = 120.0
+WRONG_WAY_MIN_MOVE = 6.0
+WRONG_WAY_MATCH_DIST = 80.0
+# Skip YOLO "group" boxes that cover too much of the frame
+MAX_PERSON_AREA_RATIO = 0.08
 VALID_DIRECTIONS = {"down", "up", "right", "left"}
 
 _session_lock = threading.Lock()
@@ -60,29 +69,34 @@ def _boxes_from_result(result, model_key: str, label_filter=None) -> List[Dict[s
     return out
 
 
-def detect_people(image: np.ndarray) -> Tuple[List[Dict[str, Any]], int]:
+def _iter_person_boxes(image: np.ndarray):
+    """Yield individual person detections tuned for crowded scenes."""
+    h_img, w_img = image.shape[:2]
+    frame_area = float(h_img * w_img)
     model = get_coco_model()
-    result = model.predict(source=image, conf=CONF, verbose=False)[0]
-    detections: List[Dict[str, Any]] = []
-    names = result.names or {}
-    if result.boxes is not None and len(result.boxes) > 0:
-        xyxy = result.boxes.xyxy.cpu().numpy()
-        confs = result.boxes.conf.cpu().numpy()
-        clss = result.boxes.cls.cpu().numpy().astype(int)
-        for box, conf, cls_id in zip(xyxy, confs, clss):
-            if int(cls_id) != PERSON_CLASS:
-                continue
-            label = str(names.get(int(cls_id), "person"))
-            x1, y1, x2, y2 = [float(v) for v in box]
-            detections.append(
-                {
-                    "model": "people",
-                    "label": label,
-                    "score": float(conf),
-                    "box": [x1, y1, x2, y2],
-                }
-            )
-    return detections, len(detections)
+    result = model.predict(
+        source=image,
+        conf=PERSON_CONF,
+        iou=0.5,
+        imgsz=PERSON_IMGSZ,
+        max_det=PERSON_MAX_DET,
+        classes=[PERSON_CLASS],
+        verbose=False,
+    )[0]
+    if result.boxes is None or len(result.boxes) == 0:
+        return
+    xyxy = result.boxes.xyxy.cpu().numpy()
+    confs = result.boxes.conf.cpu().numpy()
+    for box, conf in zip(xyxy, confs):
+        x1, y1, x2, y2 = [float(v) for v in box]
+        bw, bh = max(x2 - x1, 1.0), max(y2 - y1, 1.0)
+        area = bw * bh
+        # Drop huge group boxes that cover many people at once
+        if area > MAX_PERSON_AREA_RATIO * frame_area:
+            continue
+        if bw < 8 or bh < 12:
+            continue
+        yield x1, y1, x2, y2, float(conf)
 
 
 def _normalize_fire_smoke_label(label: str, cls_id: int) -> str:
@@ -208,21 +222,114 @@ def detect_fire_smoke(
     return dets
 
 
+def _normalize_fall_label(label: str, cls_id: int) -> str:
+    lab = label.lower().strip().replace("-", "_").replace(" ", "_")
+    if "fallen" in lab or lab in {"fall", "falling", "liedown", "lie_down", "laying"}:
+        return "fallen"
+    if "sit" in lab:
+        return "sitting"
+    if "stand" in lab:
+        return "standing"
+    # melihuzunoglu: 0=fallen, 1=sitting, 2=standing
+    if cls_id == 0:
+        return "fallen"
+    if cls_id == 1:
+        return "sitting"
+    if cls_id == 2:
+        return "standing"
+    return lab
+
+
+def _aspect_fall_boxes(image: np.ndarray) -> List[Dict[str, Any]]:
+    """
+    Heuristic: COCO person boxes that are much wider than tall
+    often indicate someone lying on the ground.
+    """
+    h_img, w_img = image.shape[:2]
+    model = get_coco_model()
+    result = model.predict(source=image, conf=0.3, verbose=False)[0]
+    dets: List[Dict[str, Any]] = []
+    if result.boxes is None or len(result.boxes) == 0:
+        return dets
+    xyxy = result.boxes.xyxy.cpu().numpy()
+    confs = result.boxes.conf.cpu().numpy()
+    clss = result.boxes.cls.cpu().numpy().astype(int)
+    for box, conf, cls_id in zip(xyxy, confs, clss):
+        if int(cls_id) != PERSON_CLASS:
+            continue
+        x1, y1, x2, y2 = [float(v) for v in box]
+        bw, bh = max(x2 - x1, 1.0), max(y2 - y1, 1.0)
+        aspect = bw / bh
+        if aspect < FALL_ASPECT_MIN:
+            continue
+        if bh > FALL_ASPECT_MAX_H_RATIO * h_img:
+            continue
+        # Prefer people lower in the frame (on the ground)
+        cy = (y1 + y2) / 2.0
+        if cy < 0.35 * h_img:
+            continue
+        score = min(0.88, 0.4 + (aspect - 1.0) * 0.25 + float(conf) * 0.2)
+        dets.append(
+            {
+                "model": "fall",
+                "label": "fallen",
+                "score": float(score),
+                "box": [x1, y1, x2, y2],
+            }
+        )
+    return dets
+
+
 def detect_fall(image: np.ndarray) -> List[Dict[str, Any]]:
-    model = get_fall_model()
-    result = model.predict(source=image, conf=CONF, verbose=False)[0]
-    dets = _boxes_from_result(result, "fall")
-    for d in dets:
-        lab = d["label"].lower().replace(" ", "_")
-        if "fallen" in lab or lab == "fall":
-            d["label"] = "fallen"
-            d["model"] = "fall"
-        elif "sit" in lab:
-            d["label"] = "sitting"
-            d["model"] = "fall"
-        elif "stand" in lab:
-            d["label"] = "standing"
-            d["model"] = "fall"
+    orig_h, orig_w = image.shape[:2]
+    infer = image
+    scale = 1.0
+    if max(orig_h, orig_w) < 640:
+        scale = 640 / max(orig_h, orig_w)
+        infer = cv2.resize(
+            image,
+            (int(orig_w * scale), int(orig_h * scale)),
+            interpolation=cv2.INTER_LINEAR,
+        )
+
+    dets: List[Dict[str, Any]] = []
+    try:
+        model = get_fall_model()
+        result = model.predict(
+            source=infer,
+            conf=FALL_CONF,
+            iou=0.45,
+            imgsz=640,
+            verbose=False,
+        )[0]
+        names = result.names or {0: "fallen", 1: "sitting", 2: "standing"}
+        if result.boxes is not None and len(result.boxes) > 0:
+            xyxy = result.boxes.xyxy.cpu().numpy()
+            confs = result.boxes.conf.cpu().numpy()
+            clss = result.boxes.cls.cpu().numpy().astype(int)
+            for box, conf, cls_id in zip(xyxy, confs, clss):
+                cls_id = int(cls_id)
+                label = _normalize_fall_label(_resolve_name(names, cls_id), cls_id)
+                if label not in ("fallen", "sitting", "standing"):
+                    continue
+                x1, y1, x2, y2 = [float(v) for v in box]
+                if scale != 1.0:
+                    x1, y1, x2, y2 = x1 / scale, y1 / scale, x2 / scale, y2 / scale
+                dets.append(
+                    {
+                        "model": "fall",
+                        "label": label,
+                        "score": float(conf),
+                        "box": [x1, y1, x2, y2],
+                    }
+                )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[fall] YOLO failed: {exc}")
+
+    # If specialized model missed a clear lying person, use aspect assist
+    if not any(d["label"] == "fallen" for d in dets):
+        dets.extend(_aspect_fall_boxes(image))
+
     return dets
 
 
@@ -293,13 +400,13 @@ def _pack_direction_dets(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for v in items:
         status = v.get("_status", "unknown")
         if status == "wrong":
-            label = "غلط"
+            label = "Wrong way"
             model = "wrong_way"
         elif status == "ok":
-            label = "صح"
+            label = "OK"
             model = "ok_way"
         else:
-            label = "تتبع"
+            label = "Tracking"
             model = "tracking"
         out.append(
             {
