@@ -56,7 +56,7 @@ function createSessionId() {
 }
 
 export default function App() {
-  const sessionId = useRef(createSessionId()).current
+  const sessionIdRef = useRef(createSessionId())
   const videoRef = useRef(null)
   const imageRef = useRef(null)
   const canvasRef = useRef(null)
@@ -77,6 +77,14 @@ export default function App() {
   const [correctDirection, setCorrectDirection] = useState('down')
 
   const enabledList = MODELS.filter((m) => enabled[m.id]).map((m) => m.id)
+
+  const changeDirection = (id) => {
+    if (id === correctDirection) return
+    setCorrectDirection(id)
+    sessionIdRef.current = createSessionId()
+    setAlerts([])
+    setDetections([])
+  }
 
   const toggleModel = (id) => {
     setEnabled((prev) => ({ ...prev, [id]: !prev[id] }))
@@ -106,19 +114,24 @@ export default function App() {
     canvas.height = height
     const ctx = canvas.getContext('2d')
     ctx.clearRect(0, 0, width, height)
+    const frameArea = width * height
     for (const d of dets) {
-      const [x1, y1, x2, y2] = d.box
+      let [x1, y1, x2, y2] = d.box
+      x1 = Math.max(0, Math.min(width, x1))
+      y1 = Math.max(0, Math.min(height, y1))
+      x2 = Math.max(0, Math.min(width, x2))
+      y2 = Math.max(0, Math.min(height, y2))
+      const bw = x2 - x1
+      const bh = y2 - y1
+      if (bw < 4 || bh < 4) continue
+      if (bw * bh > 0.12 * frameArea) continue
+
       const color = boxColor(d)
       ctx.strokeStyle = color
-      ctx.lineWidth = d.status === 'wrong' || d.label === 'غلط' ? 3 : 2
-      ctx.strokeRect(x1, y1, x2 - x1, y2 - y1)
-      const text = `${displayLabel(d)} ${(d.score * 100).toFixed(0)}%`
-      ctx.font = '14px "IBM Plex Sans Arabic", "Segoe UI", sans-serif'
-      const tw = ctx.measureText(text).width
-      ctx.fillStyle = color
-      ctx.fillRect(x1, Math.max(0, y1 - 22), tw + 10, 22)
-      ctx.fillStyle = '#041018'
-      ctx.fillText(text, x1 + 5, Math.max(15, y1 - 6))
+      ctx.lineWidth = 2
+      ctx.strokeRect(x1, y1, bw, bh)
+      ctx.fillStyle = color.length === 7 ? `${color}33` : color
+      ctx.fillRect(x1, y1, bw, bh)
     }
   }, [])
 
@@ -131,7 +144,7 @@ export default function App() {
       try {
         const form = new FormData()
         form.append('image', blob, 'frame.jpg')
-        form.append('session_id', sessionId)
+        form.append('session_id', sessionIdRef.current)
         form.append('enabled', JSON.stringify(enabledList))
         form.append('correct_direction', correctDirection)
         const res = await fetch('/api/detect', { method: 'POST', body: form })
@@ -169,7 +182,7 @@ export default function App() {
         busyRef.current = false
       }
     },
-    [enabledList, sessionId, sourceMode, drawDetections, correctDirection],
+    [enabledList, sourceMode, drawDetections, correctDirection],
   )
 
   const captureFromVideo = useCallback(() => {
@@ -198,7 +211,7 @@ export default function App() {
   useEffect(() => {
     if (!running || enabledList.length === 0) return
     if (sourceMode !== 'webcam' && sourceMode !== 'video') return
-    const id = setInterval(captureFromVideo, 700)
+    const id = setInterval(captureFromVideo, 400)
     return () => clearInterval(id)
   }, [running, enabledList.length, sourceMode, captureFromVideo])
 
@@ -322,7 +335,7 @@ export default function App() {
                   key={d.id}
                   type="button"
                   className={`direction-btn ${correctDirection === d.id ? 'on' : ''}`}
-                  onClick={() => setCorrectDirection(d.id)}
+                  onClick={() => changeDirection(d.id)}
                 >
                   <span className="direction-arrow">{d.arrow}</span>
                   <span className="direction-label">{d.label}</span>

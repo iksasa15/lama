@@ -24,14 +24,16 @@ FIRE_HSV_MIN_AREA = 180
 FIRE_HSV_MAX_AREA_RATIO = 0.035
 SMOKE_HSV_MIN_AREA_RATIO = 0.03
 
-WRONG_WAY_MIN_MOVE = 6.0
-WRONG_WAY_MATCH_DIST = 80.0
+WRONG_WAY_MIN_MOVE = 8.0
+WRONG_WAY_MATCH_DIST = 220.0
 # Skip YOLO "group" boxes that cover too much of the frame
 MAX_PERSON_AREA_RATIO = 0.08
 VALID_DIRECTIONS = {"down", "up", "right", "left"}
 
 _session_lock = threading.Lock()
-_sessions: Dict[str, List[Dict[str, float]]] = {}
+# session_id -> { "tracks": [...], "votes": {track_id: [status, ...]} }
+_sessions: Dict[str, Dict[str, Any]] = {}
+_next_track_id = 1
 
 
 def _centroid(box: List[float]) -> Tuple[float, float]:
@@ -97,6 +99,20 @@ def _iter_person_boxes(image: np.ndarray):
         if bw < 8 or bh < 12:
             continue
         yield x1, y1, x2, y2, float(conf)
+
+
+def detect_people(image: np.ndarray) -> Tuple[List[Dict[str, Any]], int]:
+    detections: List[Dict[str, Any]] = []
+    for x1, y1, x2, y2, conf in _iter_person_boxes(image):
+        detections.append(
+            {
+                "model": "people",
+                "label": "person",
+                "score": conf,
+                "box": [x1, y1, x2, y2],
+            }
+        )
+    return detections, len(detections)
 
 
 def _normalize_fire_smoke_label(label: str, cls_id: int) -> str:
@@ -333,65 +349,138 @@ def detect_fall(image: np.ndarray) -> List[Dict[str, Any]]:
     return dets
 
 
-def _is_correct_direction(dx: float, dy: float, correct_direction: str) -> bool:
-    direction = correct_direction if correct_direction in VALID_DIRECTIONS else "down"
-    if direction == "down":
-        return dy > WRONG_WAY_MIN_MOVE
-    if direction == "up":
-        return dy < -WRONG_WAY_MIN_MOVE
-    if direction == "right":
-        return dx > WRONG_WAY_MIN_MOVE
-    if direction == "left":
-        return dx < -WRONG_WAY_MIN_MOVE
-    return False
+def _box_diag(box: List[float]) -> float:
+    x1, y1, x2, y2 = box
+    return max(((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5, 1.0)
 
 
-def _is_wrong_direction(dx: float, dy: float, correct_direction: str) -> bool:
-    """Opposite of correct flow; tiny jitter returns False (unknown)."""
+def _classify_axis_move(
+    dx: float, dy: float, correct_direction: str
+) -> str:
+    """
+    Return ok | wrong | unknown using the selected axis.
+    Allows mild diagonal motion (axis component at least half the other).
+    """
     direction = correct_direction if correct_direction in VALID_DIRECTIONS else "down"
+    adx, ady = abs(dx), abs(dy)
+
+    if direction in ("left", "right"):
+        if adx < WRONG_WAY_MIN_MOVE or adx < 0.45 * ady:
+            return "unknown"
+        if direction == "right":
+            return "ok" if dx > 0 else "wrong"
+        return "ok" if dx < 0 else "wrong"
+
+    if ady < WRONG_WAY_MIN_MOVE or ady < 0.45 * adx:
+        return "unknown"
     if direction == "down":
-        return dy < -WRONG_WAY_MIN_MOVE
-    if direction == "up":
-        return dy > WRONG_WAY_MIN_MOVE
-    if direction == "right":
-        return dx < -WRONG_WAY_MIN_MOVE
-    if direction == "left":
-        return dx > WRONG_WAY_MIN_MOVE
-    return False
+        return "ok" if dy > 0 else "wrong"
+    return "ok" if dy < 0 else "wrong"
 
 
 def _track_direction(
     items: List[Dict[str, Any]], session_id: str, correct_direction: str
 ) -> bool:
     """
-    Match centroids across frames.
-    Sets item['_status'] to ok | wrong | unknown.
-    Returns True if any wrong-way.
+    Unique greedy matching + axis-gated classification.
+    Sticky status: once OK/Wrong, keep until opposite is seen twice.
     """
+    global _next_track_id
     any_wrong = False
+
     with _session_lock:
-        prev = _sessions.get(session_id, [])
-        matched_prev: List[Dict[str, float]] = []
-        for item in items:
-            best: Optional[Dict[str, float]] = None
-            best_dist = WRONG_WAY_MATCH_DIST
-            for p in prev:
+        state = _sessions.get(session_id)
+        if state is None:
+            state = {"tracks": [], "votes": {}, "sticky": {}}
+            _sessions[session_id] = state
+
+        prev_tracks: List[Dict[str, Any]] = state["tracks"]
+        votes: Dict[int, List[str]] = state["votes"]
+        sticky: Dict[int, str] = state.setdefault("sticky", {})
+
+        pairs: List[Tuple[float, int, int]] = []
+        for i, item in enumerate(items):
+            max_dist = max(WRONG_WAY_MATCH_DIST, 2.8 * _box_diag(item["box"]))
+            for j, p in enumerate(prev_tracks):
                 dist = ((item["_cx"] - p["cx"]) ** 2 + (item["_cy"] - p["cy"]) ** 2) ** 0.5
-                if dist < best_dist:
-                    best_dist = dist
-                    best = p
+                if dist <= max_dist:
+                    pairs.append((dist, i, j))
+        pairs.sort(key=lambda t: t[0])
+
+        assigned_cur: set[int] = set()
+        assigned_prev: set[int] = set()
+        match_prev: Dict[int, Dict[str, Any]] = {}
+
+        for _dist, i, j in pairs:
+            if i in assigned_cur or j in assigned_prev:
+                continue
+            assigned_cur.add(i)
+            assigned_prev.add(j)
+            match_prev[i] = prev_tracks[j]
+
+        new_tracks: List[Dict[str, Any]] = []
+        new_votes: Dict[int, List[str]] = {}
+        new_sticky: Dict[int, str] = {}
+
+        for i, item in enumerate(items):
+            raw = "unknown"
+            track_id: Optional[int] = None
+            prev = match_prev.get(i)
+            if prev is not None:
+                track_id = int(prev["id"])
+                dx = item["_cx"] - prev["cx"]
+                dy = item["_cy"] - prev["cy"]
+                raw = _classify_axis_move(dx, dy, correct_direction)
+            else:
+                track_id = _next_track_id
+                _next_track_id += 1
+
+            history = list(votes.get(track_id, []))
+            if raw in ("ok", "wrong"):
+                history.append(raw)
+                history = history[-3:]
+
+            prev_sticky = sticky.get(track_id)
+
+            # One clear move is enough to set status; sticky until opposite appears twice
             status = "unknown"
-            if best is not None:
-                dx = item["_cx"] - best["cx"]
-                dy = item["_cy"] - best["cy"]
-                if _is_wrong_direction(dx, dy, correct_direction):
-                    status = "wrong"
-                    any_wrong = True
-                elif _is_correct_direction(dx, dy, correct_direction):
-                    status = "ok"
+            if raw in ("ok", "wrong"):
+                status = raw
+            elif prev_sticky in ("ok", "wrong"):
+                status = prev_sticky
+
+            if len(history) >= 2 and history[-1] == history[-2]:
+                status = history[-1]
+
+            # Opposite needs two hits to flip sticky
+            if prev_sticky in ("ok", "wrong") and raw in ("ok", "wrong") and raw != prev_sticky:
+                opp = [h for h in history if h == raw]
+                if len(opp) < 2:
+                    status = prev_sticky
+
+            if status in ("ok", "wrong"):
+                new_sticky[track_id] = status
+            elif prev_sticky in ("ok", "wrong"):
+                new_sticky[track_id] = prev_sticky
+
             item["_status"] = status
-            matched_prev.append({"cx": item["_cx"], "cy": item["_cy"]})
-        _sessions[session_id] = matched_prev
+            if status == "wrong":
+                any_wrong = True
+
+            new_tracks.append(
+                {
+                    "id": track_id,
+                    "cx": item["_cx"],
+                    "cy": item["_cy"],
+                    "box": item["box"],
+                }
+            )
+            new_votes[track_id] = history
+
+        state["tracks"] = new_tracks
+        state["votes"] = new_votes
+        state["sticky"] = new_sticky
+
     return any_wrong
 
 
@@ -424,26 +513,17 @@ def detect_wrong_way(
     image: np.ndarray, session_id: str, correct_direction: str = "down"
 ) -> Tuple[List[Dict[str, Any]], bool]:
     """Track people walking direction against the chosen correct way."""
-    model = get_coco_model()
-    result = model.predict(source=image, conf=CONF, verbose=False)[0]
     current: List[Dict[str, Any]] = []
-    if result.boxes is not None and len(result.boxes) > 0:
-        xyxy = result.boxes.xyxy.cpu().numpy()
-        confs = result.boxes.conf.cpu().numpy()
-        clss = result.boxes.cls.cpu().numpy().astype(int)
-        for box, conf, cls_id in zip(xyxy, confs, clss):
-            if int(cls_id) != PERSON_CLASS:
-                continue
-            x1, y1, x2, y2 = [float(v) for v in box]
-            cx, cy = _centroid([x1, y1, x2, y2])
-            current.append(
-                {
-                    "score": float(conf),
-                    "box": [x1, y1, x2, y2],
-                    "_cx": cx,
-                    "_cy": cy,
-                }
-            )
+    for x1, y1, x2, y2, conf in _iter_person_boxes(image):
+        cx, cy = _centroid([x1, y1, x2, y2])
+        current.append(
+            {
+                "score": conf,
+                "box": [x1, y1, x2, y2],
+                "_cx": cx,
+                "_cy": cy,
+            }
+        )
 
     wrong = _track_direction(current, session_id, correct_direction)
     return _pack_direction_dets(current), wrong
@@ -466,47 +546,34 @@ def run_enabled(
     want_fall = "fall" in enabled
     want_wrong = "wrong_way" in enabled
 
-    # Shared COCO pass when people count and/or direction tracking need persons
     if want_people or want_wrong:
-        model = get_coco_model()
-        result = model.predict(source=image, conf=CONF, verbose=False)[0]
-        names = result.names or {}
         people_for_track: List[Dict[str, Any]] = []
-        if result.boxes is not None and len(result.boxes) > 0:
-            xyxy = result.boxes.xyxy.cpu().numpy()
-            confs = result.boxes.conf.cpu().numpy()
-            clss = result.boxes.cls.cpu().numpy().astype(int)
-            for box, conf, cls_id in zip(xyxy, confs, clss):
-                cls_id = int(cls_id)
-                if cls_id != PERSON_CLASS:
-                    continue
-                x1, y1, x2, y2 = [float(v) for v in box]
-                cx, cy = _centroid([x1, y1, x2, y2])
-                if want_people:
-                    detections.append(
-                        {
-                            "model": "people",
-                            "label": str(names.get(cls_id, "person")),
-                            "score": float(conf),
-                            "box": [x1, y1, x2, y2],
-                        }
-                    )
-                if want_wrong:
-                    people_for_track.append(
-                        {
-                            "score": float(conf),
-                            "box": [x1, y1, x2, y2],
-                            "_cx": cx,
-                            "_cy": cy,
-                        }
-                    )
-        if want_people:
-            people_count = sum(1 for d in detections if d["model"] == "people")
+        for x1, y1, x2, y2, conf in _iter_person_boxes(image):
+            cx, cy = _centroid([x1, y1, x2, y2])
+            people_for_track.append(
+                {
+                    "score": conf,
+                    "box": [x1, y1, x2, y2],
+                    "_cx": cx,
+                    "_cy": cy,
+                }
+            )
+        people_count = len(people_for_track)
         if want_wrong:
             wrong = _track_direction(people_for_track, session_id, direction)
             detections.extend(_pack_direction_dets(people_for_track))
             if wrong:
                 alerts.append("wrong_way")
+        elif want_people:
+            for p in people_for_track:
+                detections.append(
+                    {
+                        "model": "people",
+                        "label": "person",
+                        "score": p["score"],
+                        "box": p["box"],
+                    }
+                )
 
     if want_fire or want_smoke:
         fs = detect_fire_smoke(image, want_fire, want_smoke)
