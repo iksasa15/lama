@@ -8,12 +8,17 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-from models_loader import get_coco_model, get_fall_model, get_fire_smoke_model
+from models_loader import (
+    get_coco_model,
+    get_dmcount_model,
+    get_fall_model,
+    get_fire_smoke_model,
+)
 
 PERSON_CLASS = 0  # COCO
 CONF = 0.25
-PERSON_CONF = 0.40  # reject weak desk false positives (e.g. 44%)
-PERSON_IMGSZ = 640
+PERSON_CONF = 0.25  # balance distant people vs desk false positives
+PERSON_IMGSZ = 1280
 PERSON_MAX_DET = 300
 FIRE_SMOKE_CONF = 0.15
 FALL_CONF = 0.12
@@ -104,7 +109,7 @@ def _iter_person_boxes(image: np.ndarray, session_id: Optional[str] = None):
     frame_area = float(h_img * w_img)
     model = get_coco_model()
 
-    use_track = bool(session_id)
+    use_track = bool(session_id) and not str(session_id).startswith("still")
     if use_track:
         if session_id != _byte_track_session:
             _reset_byte_tracker(model)
@@ -555,15 +560,16 @@ def _pack_direction_dets(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         else:
             label = "Tracking"
             model = "tracking"
-        out.append(
-            {
-                "model": model,
-                "label": label,
-                "score": v["score"],
-                "box": v["box"],
-                "status": status,
-            }
-        )
+        row = {
+            "model": model,
+            "label": label,
+            "score": v["score"],
+            "box": v["box"],
+            "status": status,
+        }
+        if "track_id" in v:
+            row["track_id"] = v["track_id"]
+        out.append(row)
     return out
 
 
@@ -572,19 +578,59 @@ def detect_wrong_way(
 ) -> Tuple[List[Dict[str, Any]], bool]:
     """Track people walking direction against the chosen correct way."""
     current: List[Dict[str, Any]] = []
-    for x1, y1, x2, y2, conf, _tid in _iter_person_boxes(image, session_id):
+    for x1, y1, x2, y2, conf, tid in _iter_person_boxes(image, session_id):
         cx, cy = _centroid([x1, y1, x2, y2])
-        current.append(
-            {
-                "score": conf,
-                "box": [x1, y1, x2, y2],
-                "_cx": cx,
-                "_cy": cy,
-            }
-        )
+        row = {
+            "score": conf,
+            "box": [x1, y1, x2, y2],
+            "_cx": cx,
+            "_cy": cy,
+        }
+        if tid is not None:
+            row["track_id"] = tid
+        current.append(row)
 
     wrong = _track_direction(current, session_id, correct_direction)
     return _pack_direction_dets(current), wrong
+
+
+def detect_dm_count(image: np.ndarray) -> Tuple[int, List[Dict[str, Any]]]:
+    """Crowd count via DM-Count density model (no per-person boxes)."""
+    import tempfile
+    from pathlib import Path
+
+    from lwcc import LWCC
+    from PIL import Image
+
+    model = get_dmcount_model()
+    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    pil = Image.fromarray(rgb)
+    tmp = Path(tempfile.gettempdir()) / "_dmcount_frame.jpg"
+    pil.save(tmp, quality=92)
+    try:
+        raw = LWCC.get_count(
+            str(tmp),
+            model_name="DM-Count",
+            model_weights="SHB",
+            model=model,
+        )
+    except TypeError:
+        # Older lwcc versions may not accept model=
+        raw = LWCC.get_count(
+            str(tmp),
+            model_name="DM-Count",
+            model_weights="SHB",
+        )
+    count = int(max(0, round(float(raw))))
+    dets = [
+        {
+            "model": "dmcount",
+            "label": f"Crowd {count}",
+            "score": 1.0,
+            "box": [0.0, 0.0, 0.0, 0.0],
+        }
+    ]
+    return count, dets
 
 
 def run_enabled(
@@ -599,6 +645,7 @@ def run_enabled(
     direction = correct_direction if correct_direction in VALID_DIRECTIONS else "down"
 
     want_people = "people" in enabled
+    want_dmcount = "dmcount" in enabled
     want_smoke = "smoke" in enabled
     want_fire = "fire" in enabled
     want_fall = "fall" in enabled
@@ -634,6 +681,22 @@ def run_enabled(
                 if "track_id" in p:
                     det["track_id"] = p["track_id"]
                 detections.append(det)
+
+    if want_dmcount:
+        try:
+            dm_count, dm_dets = detect_dm_count(image)
+            people_count = dm_count  # DM-Count owns the displayed count when enabled
+            detections.extend(dm_dets)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[dmcount] failed: {exc}")
+            detections.append(
+                {
+                    "model": "dmcount",
+                    "label": "DM-Count error",
+                    "score": 0.0,
+                    "box": [0.0, 0.0, 0.0, 0.0],
+                }
+            )
 
     if want_fire or want_smoke:
         fs = detect_fire_smoke(image, want_fire, want_smoke)

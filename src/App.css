@@ -254,9 +254,10 @@ body {
   inset: 0;
   width: 100%;
   height: 100%;
-  object-fit: fill;
+  object-fit: contain;
   display: none;
   background: #07111f;
+  transform: translateZ(0);
 }
 
 .media.show {
@@ -270,6 +271,7 @@ body {
   height: 100%;
   z-index: 3;
   pointer-events: none;
+  transform: translateZ(0);
 }
 
 .placeholder {

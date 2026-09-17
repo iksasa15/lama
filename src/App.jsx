@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useId, useRef, useState } from 'react'
+import { startTransition, useCallback, useEffect, useId, useRef, useState } from 'react'
 import './App.css'
 
 const MODELS = [
-  { id: 'people', label: 'عدّ الأشخاص', color: '#2dd4bf' },
+  { id: 'people', label: 'عدّ الأشخاص (YOLO)', color: '#2dd4bf' },
+  { id: 'dmcount', label: 'عد الحشود (DM-Count)', color: '#a78bfa' },
   { id: 'smoke', label: 'كشف الدخان', color: '#94a3b8' },
   { id: 'fire', label: 'كشف الحريق', color: '#f97316' },
   { id: 'fall', label: 'سقوط / طوارئ', color: '#ef4444' },
@@ -18,6 +19,7 @@ const DIRECTIONS = [
 
 const COLOR_BY_MODEL = {
   people: '#2dd4bf',
+  dmcount: '#a78bfa',
   smoke: '#94a3b8',
   fire: '#f97316',
   fall: '#ef4444',
@@ -48,20 +50,70 @@ function displayLabel(d) {
     غلط: 'Wrong way',
     تتبع: 'Tracking',
   }
+  if (typeof d.label === 'string' && d.label.startsWith('Crowd')) return d.label
   return map[d.label] || d.label
 }
 
 function createSessionId() {
-  return `sess-${Math.random().toString(36).slice(2, 10)}`
+  return `live-${Math.random().toString(36).slice(2, 10)}`
 }
+
+/** Letterbox rect matching CSS object-fit: contain */
+function containRect(nw, nh, cw, ch) {
+  const scale = Math.min(cw / nw, ch / nh)
+  const dw = nw * scale
+  const dh = nh * scale
+  return {
+    scale,
+    ox: (cw - dw) / 2,
+    oy: (ch - dh) / 2,
+    dw,
+    dh,
+  }
+}
+
+function boxIou(a, b) {
+  const x1 = Math.max(a[0], b[0])
+  const y1 = Math.max(a[1], b[1])
+  const x2 = Math.min(a[2], b[2])
+  const y2 = Math.min(a[3], b[3])
+  const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1)
+  if (inter <= 0) return 0
+  const areaA = Math.max(0, a[2] - a[0]) * Math.max(0, a[3] - a[1])
+  const areaB = Math.max(0, b[2] - b[0]) * Math.max(0, b[3] - b[1])
+  return inter / (areaA + areaB - inter + 1e-6)
+}
+
+function lerpBox(from, to, t) {
+  return [
+    from[0] + (to[0] - from[0]) * t,
+    from[1] + (to[1] - from[1]) * t,
+    from[2] + (to[2] - from[2]) * t,
+    from[3] + (to[3] - from[3]) * t,
+  ]
+}
+
+const TRACK_HOLD_MS = 1000
+const LERP_SPEED = 0.35
+const IOU_MATCH = 0.25
 
 export default function App() {
   const sessionIdRef = useRef(createSessionId())
   const videoRef = useRef(null)
   const imageRef = useRef(null)
   const canvasRef = useRef(null)
+  const stageRef = useRef(null)
   const streamRef = useRef(null)
   const busyRef = useRef(false)
+  const captureCanvasRef = useRef(null)
+  const lastDrawRef = useRef({ dets: [], w: 0, h: 0 })
+  const canvasSizeRef = useRef({ w: 0, h: 0, dpr: 1 })
+  const tracksRef = useRef(new Map()) // id -> { box, target, color, lastSeen, meta }
+  const frameSizeRef = useRef({ w: 640, h: 480 })
+  const tempIdRef = useRef(1)
+  const enabledRef = useRef({})
+  const sourceModeRef = useRef('idle')
+  const directionRef = useRef('down')
   const fileInputId = useId()
 
   const [enabled, setEnabled] = useState(() =>
@@ -76,12 +128,18 @@ export default function App() {
   const [running, setRunning] = useState(false)
   const [correctDirection, setCorrectDirection] = useState('down')
 
+  enabledRef.current = enabled
+  sourceModeRef.current = sourceMode
+  directionRef.current = correctDirection
+
   const enabledList = MODELS.filter((m) => enabled[m.id]).map((m) => m.id)
+  const enabledKey = enabledList.join(',')
 
   const changeDirection = (id) => {
     if (id === correctDirection) return
     setCorrectDirection(id)
     sessionIdRef.current = createSessionId()
+    tracksRef.current.clear()
     setAlerts([])
     setDetections([])
   }
@@ -107,114 +165,263 @@ export default function App() {
     ctx.clearRect(0, 0, canvas.width, canvas.height)
   }
 
-  const drawDetections = useCallback((dets, width, height) => {
-    const canvas = canvasRef.current
-    if (!canvas) return
-    canvas.width = width
-    canvas.height = height
-    const ctx = canvas.getContext('2d')
-    ctx.clearRect(0, 0, width, height)
-    const frameArea = width * height
-    for (const d of dets) {
-      let [x1, y1, x2, y2] = d.box
-      x1 = Math.max(0, Math.min(width, x1))
-      y1 = Math.max(0, Math.min(height, y1))
-      x2 = Math.max(0, Math.min(width, x2))
-      y2 = Math.max(0, Math.min(height, y2))
-      const bw = x2 - x1
-      const bh = y2 - y1
-      if (bw < 4 || bh < 4) continue
-      // Only hide near-full-frame blobs (close webcam people are often large)
-      if (bw * bh > 0.55 * frameArea) continue
+  const clearTracks = useCallback(() => {
+    tracksRef.current.clear()
+    clearCanvas()
+  }, [])
 
-      const color = boxColor(d)
-      ctx.strokeStyle = color
-      ctx.lineWidth = Math.max(3, Math.round(Math.min(width, height) / 200))
-      ctx.strokeRect(x1, y1, bw, bh)
-      ctx.fillStyle = color.length === 7 ? `${color}44` : color
-      ctx.fillRect(x1, y1, bw, bh)
+  const paintTracks = useCallback(() => {
+    const canvas = canvasRef.current
+    const stage = stageRef.current
+    const { w: naturalW, h: naturalH } = frameSizeRef.current
+    if (!canvas || !stage || !naturalW || !naturalH) return
+
+    const cw = Math.max(1, stage.clientWidth)
+    const ch = Math.max(1, stage.clientHeight)
+    const dpr = window.devicePixelRatio || 1
+    const needResize =
+      canvasSizeRef.current.w !== cw ||
+      canvasSizeRef.current.h !== ch ||
+      canvasSizeRef.current.dpr !== dpr
+
+    if (needResize) {
+      canvas.width = Math.round(cw * dpr)
+      canvas.height = Math.round(ch * dpr)
+      canvas.style.width = `${cw}px`
+      canvas.style.height = `${ch}px`
+      canvasSizeRef.current = { w: cw, h: ch, dpr }
+    }
+
+    const ctx = canvas.getContext('2d')
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+    ctx.clearRect(0, 0, cw, ch)
+
+    const { scale, ox, oy } = containRect(naturalW, naturalH, cw, ch)
+    ctx.lineWidth = Math.max(2, Math.round(Math.min(cw, ch) / 180))
+
+    for (const tr of tracksRef.current.values()) {
+      const [x1, y1, x2, y2] = tr.box
+      const bw = (x2 - x1) * scale
+      const bh = (y2 - y1) * scale
+      if (bw < 2 || bh < 2) continue
+      ctx.strokeStyle = tr.color
+      ctx.strokeRect(ox + x1 * scale, oy + y1 * scale, bw, bh)
     }
   }, [])
 
-  const sendFrame = useCallback(
-    async (blob) => {
-      if (!blob || enabledList.length === 0 || busyRef.current) return
-      busyRef.current = true
-      setStatus('جاري التحليل...')
-      setError('')
-      try {
-        const form = new FormData()
-        form.append('image', blob, 'frame.jpg')
-        form.append('session_id', sessionIdRef.current)
-        form.append('enabled', JSON.stringify(enabledList))
-        form.append('correct_direction', correctDirection)
-        const res = await fetch('/api/detect', { method: 'POST', body: form })
-        if (!res.ok) {
-          const text = await res.text()
-          throw new Error(text || `HTTP ${res.status}`)
+  const mergeDetections = useCallback((dets, naturalW, naturalH) => {
+    frameSizeRef.current = { w: naturalW, h: naturalH }
+    const now = performance.now()
+    const tracks = tracksRef.current
+    const used = new Set()
+
+    const drawable = dets.filter(
+      (d) => d.box && d.box.length >= 4 && d.box[2] - d.box[0] > 2 && d.box[3] - d.box[1] > 2,
+    )
+
+    for (const d of drawable) {
+      const color = boxColor(d)
+      let key =
+        d.track_id != null && d.track_id !== undefined
+          ? `t-${d.track_id}`
+          : null
+
+      if (!key) {
+        let bestId = null
+        let bestIou = IOU_MATCH
+        for (const [id, tr] of tracks) {
+          if (used.has(id)) continue
+          const iou = boxIou(tr.target || tr.box, d.box)
+          if (iou > bestIou) {
+            bestIou = iou
+            bestId = id
+          }
         }
-        const data = await res.json()
+        key = bestId || `tmp-${tempIdRef.current++}`
+      }
+
+      used.add(key)
+      const prev = tracks.get(key)
+      if (prev) {
+        prev.target = d.box
+        prev.color = color
+        prev.lastSeen = now
+        prev.meta = d
+      } else {
+        tracks.set(key, {
+          box: [...d.box],
+          target: [...d.box],
+          color,
+          lastSeen: now,
+          meta: d,
+        })
+      }
+    }
+
+    lastDrawRef.current = { dets: drawable, w: naturalW, h: naturalH }
+  }, [])
+
+  const drawStillDetections = useCallback(
+    (dets, naturalW, naturalH) => {
+      tracksRef.current.clear()
+      mergeDetections(dets, naturalW, naturalH)
+      // Snap boxes to target (no lerp for stills)
+      for (const tr of tracksRef.current.values()) {
+        tr.box = [...tr.target]
+      }
+      paintTracks()
+    },
+    [mergeDetections, paintTracks],
+  )
+
+  const sendFrame = useCallback(async (blob, naturalW, naturalH, sentW, sentH) => {
+    const enabledMap = enabledRef.current
+    const list = MODELS.filter((m) => enabledMap[m.id]).map((m) => m.id)
+    if (!blob || list.length === 0 || busyRef.current) return
+    busyRef.current = true
+    const mode = sourceModeRef.current
+    try {
+      const sessionId = mode === 'image' ? 'still' : sessionIdRef.current
+      const form = new FormData()
+      form.append('image', blob, 'frame.jpg')
+      form.append('session_id', sessionId)
+      form.append('enabled', JSON.stringify(list))
+      form.append('correct_direction', directionRef.current)
+      const res = await fetch('/api/detect', { method: 'POST', body: form })
+      if (!res.ok) {
+        const text = await res.text()
+        throw new Error(text || `HTTP ${res.status}`)
+      }
+      const data = await res.json()
+
+      const sx = naturalW && sentW ? naturalW / sentW : 1
+      const sy = naturalH && sentH ? naturalH / sentH : 1
+      const dets = (data.detections ?? []).map((d) => {
+        if (!d.box || d.box.length < 4) return d
+        const [x1, y1, x2, y2] = d.box
+        return { ...d, box: [x1 * sx, y1 * sy, x2 * sx, y2 * sy] }
+      })
+
+      const nw = naturalW || sentW || 640
+      const nh = naturalH || sentH || 480
+      if (mode === 'image') {
+        drawStillDetections(dets, nw, nh)
+      } else {
+        mergeDetections(dets, nw, nh)
+      }
+
+      startTransition(() => {
         setPeopleCount(data.people_count ?? 0)
         setAlerts(data.alerts ?? [])
         setDetections(data.detections ?? [])
-
-        let w = 640
-        let h = 480
-        if (sourceMode === 'webcam' || sourceMode === 'video') {
-          const v = videoRef.current
-          if (v) {
-            w = v.videoWidth || w
-            h = v.videoHeight || h
-          }
-        } else if (sourceMode === 'image' && imageRef.current) {
-          w = imageRef.current.naturalWidth || w
-          h = imageRef.current.naturalHeight || h
-        }
-        drawDetections(data.detections ?? [], w, h)
-        setStatus('تم')
-      } catch (err) {
-        setError(
-          err.message === 'Failed to fetch' || /ECONNREFUSED|proxy/i.test(err.message)
-            ? 'السيرفر غير متصل — شغّل: npm run dev:all'
-            : err.message || 'فشل الطلب — تأكد أن سيرفر بايثون يعمل',
-        )
-        setStatus('خطأ')
-      } finally {
-        busyRef.current = false
-      }
-    },
-    [enabledList, sourceMode, drawDetections, correctDirection],
-  )
+        if (mode !== 'image') setStatus('مباشر')
+        else setStatus('تم')
+      })
+    } catch (err) {
+      setError(
+        err.message === 'Failed to fetch' || /ECONNREFUSED|proxy/i.test(err.message)
+          ? 'السيرفر غير متصل — شغّل: npm run dev:all'
+          : err.message || 'فشل الطلب — تأكد أن سيرفر بايثون يعمل',
+      )
+      setStatus('خطأ')
+    } finally {
+      busyRef.current = false
+    }
+  }, [drawStillDetections, mergeDetections])
 
   const captureFromVideo = useCallback(() => {
+    if (busyRef.current) return
     const video = videoRef.current
     if (!video || video.readyState < 2) return
-    const canvas = document.createElement('canvas')
-    canvas.width = video.videoWidth
-    canvas.height = video.videoHeight
-    const ctx = canvas.getContext('2d')
-    ctx.drawImage(video, 0, 0)
-    canvas.toBlob((blob) => sendFrame(blob), 'image/jpeg', 0.92)
+    const vw = video.videoWidth
+    const vh = video.videoHeight
+    if (!vw || !vh) return
+
+    const maxW = 640
+    const scale = Math.min(1, maxW / vw)
+    const w = Math.max(1, Math.round(vw * scale))
+    const h = Math.max(1, Math.round(vh * scale))
+
+    let canvas = captureCanvasRef.current
+    if (!canvas) {
+      canvas = document.createElement('canvas')
+      captureCanvasRef.current = canvas
+    }
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w
+      canvas.height = h
+    }
+    const ctx = canvas.getContext('2d', { alpha: false })
+    ctx.drawImage(video, 0, 0, w, h)
+    canvas.toBlob(
+      (blob) => {
+        if (blob) sendFrame(blob, vw, vh, w, h)
+      },
+      'image/jpeg',
+      0.6,
+    )
   }, [sendFrame])
 
   const captureFromImage = useCallback(() => {
     const img = imageRef.current
     if (!img || !img.complete) return
+    const nw = img.naturalWidth
+    const nh = img.naturalHeight
+    const maxW = 1280
+    const scale = Math.min(1, maxW / nw)
+    const w = Math.max(1, Math.round(nw * scale))
+    const h = Math.max(1, Math.round(nh * scale))
     const canvas = document.createElement('canvas')
-    canvas.width = img.naturalWidth
-    canvas.height = img.naturalHeight
-    const ctx = canvas.getContext('2d')
-    ctx.drawImage(img, 0, 0)
-    canvas.toBlob((blob) => sendFrame(blob), 'image/jpeg', 0.92)
+    canvas.width = w
+    canvas.height = h
+    const ctx = canvas.getContext('2d', { alpha: false })
+    ctx.drawImage(img, 0, 0, w, h)
+    canvas.toBlob(
+      (blob) => {
+        if (blob) sendFrame(blob, nw, nh, w, h)
+      },
+      'image/jpeg',
+      0.85,
+    )
   }, [sendFrame])
 
-  // Poll webcam / video frames
+  // Live: detect + continuous smooth box painting
   useEffect(() => {
-    if (!running || enabledList.length === 0) return
+    if (!running || !enabledKey) return
     if (sourceMode !== 'webcam' && sourceMode !== 'video') return
-    const id = setInterval(captureFromVideo, 400)
-    return () => clearInterval(id)
-  }, [running, enabledList.length, sourceMode, captureFromVideo])
+
+    const hasHeavy = enabledKey.includes('dmcount')
+    const minGapMs = hasHeavy ? 2500 : 350
+    let alive = true
+    let lastTry = 0
+    let raf = 0
+
+    const tick = (t) => {
+      if (!alive) return
+
+      const tracks = tracksRef.current
+      const now = t
+      for (const [id, tr] of [...tracks.entries()]) {
+        if (now - tr.lastSeen > TRACK_HOLD_MS) {
+          tracks.delete(id)
+          continue
+        }
+        tr.box = lerpBox(tr.box, tr.target, LERP_SPEED)
+      }
+      paintTracks()
+
+      if (t - lastTry >= minGapMs && !busyRef.current) {
+        lastTry = t
+        captureFromVideo()
+      }
+      raf = requestAnimationFrame(tick)
+    }
+    raf = requestAnimationFrame(tick)
+    return () => {
+      alive = false
+      cancelAnimationFrame(raf)
+    }
+  }, [running, enabledKey, sourceMode, captureFromVideo, paintTracks])
 
   // Analyze still image when ready / models change
   useEffect(() => {
@@ -243,9 +450,17 @@ export default function App() {
             !/iriun|obs|virtual|droidcam|epoccam|manyCam/i.test(d.label),
         ) || cameras[0]
 
+      const videoBase = {
+        frameRate: { ideal: 60, max: 60 },
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+      }
       const constraints = preferred?.deviceId
-        ? { video: { deviceId: { exact: preferred.deviceId } }, audio: false }
-        : { video: true, audio: false }
+        ? {
+            video: { ...videoBase, deviceId: { exact: preferred.deviceId } },
+            audio: false,
+          }
+        : { video: videoBase, audio: false }
 
       const stream = await navigator.mediaDevices.getUserMedia(constraints)
       streamRef.current = stream
@@ -253,14 +468,20 @@ export default function App() {
         videoRef.current.srcObject = stream
         await videoRef.current.play()
       }
+      const track = stream.getVideoTracks()[0]
+      const settings = track?.getSettings?.() || {}
+      const fps = settings.frameRate ? Math.round(settings.frameRate) : null
       setSourceMode('webcam')
       setRunning(true)
+      sessionIdRef.current = createSessionId()
       setStatus(
         preferred?.label
-          ? `الكاميرا تعمل: ${preferred.label}`
-          : 'الكاميرا تعمل',
+          ? `مباشر · ${preferred.label}${fps ? ` · ${fps}fps` : ''}`
+          : fps
+            ? `مباشر · ${fps}fps`
+            : 'مباشر',
       )
-      clearCanvas()
+      clearTracks()
     } catch (err) {
       setError(
         'تعذر فتح الكاميرا. اسمح للموقع بالكاميرا من قفل المتصفح، أو استخدم «رفع صورة / فيديو». ' +
@@ -273,7 +494,7 @@ export default function App() {
     const file = e.target.files?.[0]
     if (!file) return
     stopCamera()
-    clearCanvas()
+    clearTracks()
     setAlerts([])
     setDetections([])
     setPeopleCount(0)
@@ -290,6 +511,7 @@ export default function App() {
       }
     } else if (file.type.startsWith('video/')) {
       const url = URL.createObjectURL(file)
+      sessionIdRef.current = createSessionId()
       if (videoRef.current) {
         videoRef.current.srcObject = null
         videoRef.current.src = url
@@ -318,11 +540,19 @@ export default function App() {
       imageRef.current.removeAttribute('src')
     }
     setSourceMode('idle')
-    clearCanvas()
+    clearTracks()
     setStatus('متوقف')
   }
 
   useEffect(() => () => stopCamera(), [stopCamera])
+
+  useEffect(() => {
+    const onResize = () => {
+      if (frameSizeRef.current.w) paintTracks()
+    }
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [paintTracks])
 
   return (
     <div className="app" dir="rtl">
@@ -402,7 +632,7 @@ export default function App() {
       </section>
 
       <div className="workspace">
-        <div className="stage">
+        <div className="stage" ref={stageRef}>
           <video
             ref={videoRef}
             className={

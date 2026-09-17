@@ -11,7 +11,7 @@ from ultralytics import YOLO
 from pathlib import Path
 
 _lock = threading.Lock()
-_cache: Dict[str, YOLO] = {}
+_cache: Dict[str, object] = {}
 
 # Hub repos verified via Hugging Face MCP
 # D-Fire fine-tune: class 0=smoke, 1=fire
@@ -77,6 +77,20 @@ def get_fall_model() -> YOLO:
         return _cache["fall"]
 
 
+def get_dmcount_model():
+    """DM-Count via LWCC (ShanghaiTech Part B — street / medium crowds)."""
+    with _lock:
+        if "dmcount" not in _cache:
+            from lwcc import LWCC
+
+            _cache["dmcount"] = LWCC.load_model(
+                model_name="DM-Count",
+                model_weights="SHB",
+            )
+            print("[models] DM-Count (SHB) ready")
+        return _cache["dmcount"]
+
+
 def preload_models() -> None:
     """Warm caches in background so first UI click is faster."""
     try:
@@ -94,3 +108,8 @@ def preload_models() -> None:
         print("[preload] fall ready")
     except Exception as exc:  # noqa: BLE001
         print(f"[preload] fall failed: {exc}")
+    try:
+        get_dmcount_model()
+        print("[preload] DM-Count ready")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[preload] DM-Count failed: {exc}")
