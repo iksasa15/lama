@@ -38,6 +38,13 @@ _session_lock = threading.Lock()
 # session_id -> { "tracks": [...], "votes": {track_id: [status, ...]} }
 _sessions: Dict[str, Dict[str, Any]] = {}
 _next_track_id = 1
+_byte_track_session: Optional[str] = None
+
+
+def _reset_byte_tracker(model) -> None:
+    """Clear Ultralytics ByteTrack state (e.g. after session / direction change)."""
+    # Drop predictor so the next track/predict call re-inits cleanly
+    model.predictor = None
 
 
 def _centroid(box: List[float]) -> Tuple[float, float]:
@@ -75,53 +82,94 @@ def _boxes_from_result(result, model_key: str, label_filter=None) -> List[Dict[s
     return out
 
 
-def _iter_person_boxes(image: np.ndarray):
-    """Yield individual person detections tuned for crowded scenes."""
+def _pass_person_geometry(x1: float, y1: float, x2: float, y2: float, frame_area: float) -> bool:
+    bw, bh = max(x2 - x1, 1.0), max(y2 - y1, 1.0)
+    area_ratio = (bw * bh) / frame_area
+    if area_ratio > MAX_PERSON_AREA_RATIO or area_ratio < MIN_PERSON_AREA_RATIO:
+        return False
+    if bw < 8 or bh < 12:
+        return False
+    if (bh / bw) < MIN_PERSON_ASPECT:
+        return False
+    return True
+
+
+def _iter_person_boxes(image: np.ndarray, session_id: Optional[str] = None):
+    """
+    Detect COCO person (class 0) with Ultralytics YOLO + ByteTrack when session_id
+    is set (webcam/video). Falls back to predict for one-shot images.
+    """
+    global _byte_track_session
     h_img, w_img = image.shape[:2]
     frame_area = float(h_img * w_img)
     model = get_coco_model()
-    result = model.predict(
-        source=image,
-        conf=PERSON_CONF,
-        iou=0.5,
-        imgsz=PERSON_IMGSZ,
-        max_det=PERSON_MAX_DET,
-        classes=[PERSON_CLASS],
-        verbose=False,
-    )[0]
-    if result.boxes is None or len(result.boxes) == 0:
+
+    use_track = bool(session_id)
+    if use_track:
+        if session_id != _byte_track_session:
+            _reset_byte_tracker(model)
+            _byte_track_session = session_id
+        try:
+            result = model.track(
+                source=image,
+                conf=PERSON_CONF,
+                iou=0.5,
+                imgsz=PERSON_IMGSZ,
+                max_det=PERSON_MAX_DET,
+                classes=[PERSON_CLASS],
+                tracker="bytetrack.yaml",
+                persist=True,
+                verbose=False,
+            )[0]
+        except Exception as exc:  # noqa: BLE001
+            print(f"[people] ByteTrack failed, using predict: {exc}")
+            use_track = False
+            result = None
+            model.predictor = None
+    else:
+        result = None
+
+    if not use_track or result is None:
+        result = model.predict(
+            source=image,
+            conf=PERSON_CONF,
+            iou=0.5,
+            imgsz=PERSON_IMGSZ,
+            max_det=PERSON_MAX_DET,
+            classes=[PERSON_CLASS],
+            verbose=False,
+        )[0]
+
+    if result is None or result.boxes is None or len(result.boxes) == 0:
         return
+
     xyxy = result.boxes.xyxy.cpu().numpy()
     confs = result.boxes.conf.cpu().numpy()
-    for box, conf in zip(xyxy, confs):
+    ids = None
+    if getattr(result.boxes, "id", None) is not None:
+        ids = result.boxes.id.cpu().numpy()
+
+    for i, (box, conf) in enumerate(zip(xyxy, confs)):
         x1, y1, x2, y2 = [float(v) for v in box]
-        bw, bh = max(x2 - x1, 1.0), max(y2 - y1, 1.0)
-        area = bw * bh
-        area_ratio = area / frame_area
-        # Drop huge group boxes that cover many people at once
-        if area_ratio > MAX_PERSON_AREA_RATIO:
+        if not _pass_person_geometry(x1, y1, x2, y2, frame_area):
             continue
-        if area_ratio < MIN_PERSON_AREA_RATIO:
-            continue
-        if bw < 8 or bh < 12:
-            continue
-        # Flat desk mats / trays are often mistaken as person at low conf
-        if (bh / bw) < MIN_PERSON_ASPECT:
-            continue
-        yield x1, y1, x2, y2, float(conf)
+        tid = int(ids[i]) if ids is not None else None
+        yield x1, y1, x2, y2, float(conf), tid
 
 
 def detect_people(image: np.ndarray) -> Tuple[List[Dict[str, Any]], int]:
+    """Count persons = len([box for box in boxes if cls == 0]) — COCO person."""
     detections: List[Dict[str, Any]] = []
-    for x1, y1, x2, y2, conf in _iter_person_boxes(image):
-        detections.append(
-            {
-                "model": "people",
-                "label": "person",
-                "score": conf,
-                "box": [x1, y1, x2, y2],
-            }
-        )
+    for x1, y1, x2, y2, conf, tid in _iter_person_boxes(image):
+        det: Dict[str, Any] = {
+            "model": "people",
+            "label": "person",
+            "score": conf,
+            "box": [x1, y1, x2, y2],
+        }
+        if tid is not None:
+            det["track_id"] = tid
+        detections.append(det)
     return detections, len(detections)
 
 
@@ -524,7 +572,7 @@ def detect_wrong_way(
 ) -> Tuple[List[Dict[str, Any]], bool]:
     """Track people walking direction against the chosen correct way."""
     current: List[Dict[str, Any]] = []
-    for x1, y1, x2, y2, conf in _iter_person_boxes(image):
+    for x1, y1, x2, y2, conf, _tid in _iter_person_boxes(image, session_id):
         cx, cy = _centroid([x1, y1, x2, y2])
         current.append(
             {
@@ -558,16 +606,17 @@ def run_enabled(
 
     if want_people or want_wrong:
         people_for_track: List[Dict[str, Any]] = []
-        for x1, y1, x2, y2, conf in _iter_person_boxes(image):
+        for x1, y1, x2, y2, conf, tid in _iter_person_boxes(image, session_id):
             cx, cy = _centroid([x1, y1, x2, y2])
-            people_for_track.append(
-                {
-                    "score": conf,
-                    "box": [x1, y1, x2, y2],
-                    "_cx": cx,
-                    "_cy": cy,
-                }
-            )
+            row: Dict[str, Any] = {
+                "score": conf,
+                "box": [x1, y1, x2, y2],
+                "_cx": cx,
+                "_cy": cy,
+            }
+            if tid is not None:
+                row["track_id"] = tid
+            people_for_track.append(row)
         people_count = len(people_for_track)
         if want_wrong:
             wrong = _track_direction(people_for_track, session_id, direction)
@@ -576,14 +625,15 @@ def run_enabled(
                 alerts.append("wrong_way")
         elif want_people:
             for p in people_for_track:
-                detections.append(
-                    {
-                        "model": "people",
-                        "label": "person",
-                        "score": p["score"],
-                        "box": p["box"],
-                    }
-                )
+                det = {
+                    "model": "people",
+                    "label": "person",
+                    "score": p["score"],
+                    "box": p["box"],
+                }
+                if "track_id" in p:
+                    det["track_id"] = p["track_id"]
+                detections.append(det)
 
     if want_fire or want_smoke:
         fs = detect_fire_smoke(image, want_fire, want_smoke)

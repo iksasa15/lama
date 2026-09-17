@@ -1,7 +1,7 @@
 # لوحة الكشف المتعدد (React + FastAPI + Hugging Face)
 
 مشروع لكشف:
-- عدّ الأشخاص (موديل محلي **YOLO11m** في `server/weights/yolo11m.pt`)
+- عدّ الأشخاص: **Ultralytics YOLO11m** (مثل YOLOv8 Detect، فئة `person=0`) + **ByteTrack** للكاميرا/الفيديو — الأنسب للعد المباشر. CSRNet/DM-Count مخصّصة لازدحام شديد جداً وليست مطلوبة هنا.
 - الدخان
 - الحريق
 - السقوط / الطوارئ
