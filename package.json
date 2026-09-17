@@ -8,7 +8,7 @@
     "build": "vite build",
     "lint": "oxlint",
     "preview": "vite preview",
-    "server": "cd server && .venv\\Scripts\\uvicorn main:app --reload --host 127.0.0.1 --port 8010 --reload-exclude \".venv/*\" --reload-exclude \"*/.venv/*\" --reload-exclude \"__pycache__/*\" --reload-exclude \"weights/*\"",
+    "server": "cd server && .venv\\Scripts\\uvicorn main:app --reload --host 127.0.0.1 --port 8010 --reload-exclude .venv --reload-exclude __pycache__ --reload-exclude weights",
     "dev:all": "concurrently -n api,ui -c cyan,magenta \"npm run server\" \"npm run dev\""
   },
   "dependencies": {
