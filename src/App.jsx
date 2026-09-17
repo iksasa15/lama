@@ -65,7 +65,7 @@ export default function App() {
   const fileInputId = useId()
 
   const [enabled, setEnabled] = useState(() =>
-    Object.fromEntries(MODELS.map((m) => [m.id, false])),
+    Object.fromEntries(MODELS.map((m) => [m.id, m.id === 'people'])),
   )
   const [sourceMode, setSourceMode] = useState('idle') // idle | webcam | image | video
   const [status, setStatus] = useState('اختر موديلات وفعّل الكاميرا أو ارفع ملفاً')
@@ -124,13 +124,14 @@ export default function App() {
       const bw = x2 - x1
       const bh = y2 - y1
       if (bw < 4 || bh < 4) continue
-      if (bw * bh > 0.12 * frameArea) continue
+      // Only hide near-full-frame blobs (close webcam people are often large)
+      if (bw * bh > 0.55 * frameArea) continue
 
       const color = boxColor(d)
       ctx.strokeStyle = color
-      ctx.lineWidth = 2
+      ctx.lineWidth = Math.max(3, Math.round(Math.min(width, height) / 200))
       ctx.strokeRect(x1, y1, bw, bh)
-      ctx.fillStyle = color.length === 7 ? `${color}33` : color
+      ctx.fillStyle = color.length === 7 ? `${color}44` : color
       ctx.fillRect(x1, y1, bw, bh)
     }
   }, [])
@@ -225,10 +226,28 @@ export default function App() {
     setError('')
     stopCamera()
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'environment' },
+      // Ask permission first so device labels are available
+      const warm = await navigator.mediaDevices.getUserMedia({
+        video: true,
         audio: false,
       })
+      warm.getTracks().forEach((t) => t.stop())
+
+      const devices = await navigator.mediaDevices.enumerateDevices()
+      const cameras = devices.filter((d) => d.kind === 'videoinput')
+      // Prefer real laptop/webcam over Iriun / virtual cams
+      const preferred =
+        cameras.find(
+          (d) =>
+            d.label &&
+            !/iriun|obs|virtual|droidcam|epoccam|manyCam/i.test(d.label),
+        ) || cameras[0]
+
+      const constraints = preferred?.deviceId
+        ? { video: { deviceId: { exact: preferred.deviceId } }, audio: false }
+        : { video: true, audio: false }
+
+      const stream = await navigator.mediaDevices.getUserMedia(constraints)
       streamRef.current = stream
       if (videoRef.current) {
         videoRef.current.srcObject = stream
@@ -236,10 +255,17 @@ export default function App() {
       }
       setSourceMode('webcam')
       setRunning(true)
-      setStatus('الكاميرا تعمل')
+      setStatus(
+        preferred?.label
+          ? `الكاميرا تعمل: ${preferred.label}`
+          : 'الكاميرا تعمل',
+      )
       clearCanvas()
     } catch (err) {
-      setError('تعذر فتح الكاميرا: ' + (err.message || err))
+      setError(
+        'تعذر فتح الكاميرا. اسمح للموقع بالكاميرا من قفل المتصفح، أو استخدم «رفع صورة / فيديو». ' +
+          (err.message || err),
+      )
     }
   }
 

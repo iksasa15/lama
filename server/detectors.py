@@ -12,8 +12,8 @@ from models_loader import get_coco_model, get_fall_model, get_fire_smoke_model
 
 PERSON_CLASS = 0  # COCO
 CONF = 0.25
-PERSON_CONF = 0.08  # lower for dense crowds
-PERSON_IMGSZ = 960
+PERSON_CONF = 0.12  # CrowdHuman person-only
+PERSON_IMGSZ = 640
 PERSON_MAX_DET = 300
 FIRE_SMOKE_CONF = 0.15
 FALL_CONF = 0.12
@@ -26,8 +26,8 @@ SMOKE_HSV_MIN_AREA_RATIO = 0.03
 
 WRONG_WAY_MIN_MOVE = 8.0
 WRONG_WAY_MATCH_DIST = 220.0
-# Skip YOLO "group" boxes that cover too much of the frame
-MAX_PERSON_AREA_RATIO = 0.08
+# Skip only near-full-frame group boxes (webcam close-ups are often 20–50%)
+MAX_PERSON_AREA_RATIO = 0.55
 VALID_DIRECTIONS = {"down", "up", "right", "left"}
 
 _session_lock = threading.Lock()
