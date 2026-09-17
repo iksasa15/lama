@@ -12,7 +12,7 @@ from models_loader import get_coco_model, get_fall_model, get_fire_smoke_model
 
 PERSON_CLASS = 0  # COCO
 CONF = 0.25
-PERSON_CONF = 0.12  # CrowdHuman person-only
+PERSON_CONF = 0.40  # reject weak desk false positives (e.g. 44%)
 PERSON_IMGSZ = 640
 PERSON_MAX_DET = 300
 FIRE_SMOKE_CONF = 0.15
@@ -28,7 +28,11 @@ WRONG_WAY_MIN_MOVE = 8.0
 WRONG_WAY_MATCH_DIST = 220.0
 # Skip only near-full-frame group boxes (webcam close-ups are often 20–50%)
 MAX_PERSON_AREA_RATIO = 0.55
+MIN_PERSON_AREA_RATIO = 0.008
+# Drop very flat boxes (desk mats / keyboards mistaken as person)
+MIN_PERSON_ASPECT = 0.65  # height/width
 VALID_DIRECTIONS = {"down", "up", "right", "left"}
+
 
 _session_lock = threading.Lock()
 # session_id -> { "tracks": [...], "votes": {track_id: [status, ...]} }
@@ -93,10 +97,16 @@ def _iter_person_boxes(image: np.ndarray):
         x1, y1, x2, y2 = [float(v) for v in box]
         bw, bh = max(x2 - x1, 1.0), max(y2 - y1, 1.0)
         area = bw * bh
+        area_ratio = area / frame_area
         # Drop huge group boxes that cover many people at once
-        if area > MAX_PERSON_AREA_RATIO * frame_area:
+        if area_ratio > MAX_PERSON_AREA_RATIO:
+            continue
+        if area_ratio < MIN_PERSON_AREA_RATIO:
             continue
         if bw < 8 or bh < 12:
+            continue
+        # Flat desk mats / trays are often mistaken as person at low conf
+        if (bh / bw) < MIN_PERSON_ASPECT:
             continue
         yield x1, y1, x2, y2, float(conf)
 

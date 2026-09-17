@@ -8,6 +8,7 @@ from typing import Dict
 
 from huggingface_hub import hf_hub_download
 from ultralytics import YOLO
+from pathlib import Path
 
 _lock = threading.Lock()
 _cache: Dict[str, YOLO] = {}
@@ -18,9 +19,9 @@ FIRE_SMOKE_REPO = "rabahdev/fire-smoke-yolov8n"
 FIRE_SMOKE_FILE = "best.pt"
 FALL_REPO = "melihuzunoglu/human-fall-detection"
 FALL_FILE = "best.pt"
-# CrowdHuman person-only detector (class 0 = person)
-PERSON_REPO = "raghavendra24/crowdhuman-yolov8n"
-PERSON_FILE = "crowdhuman_yolov8n_best.pt"
+# Local person weights (downloaded to server/weights/)
+_WEIGHTS_DIR = Path(__file__).resolve().parent / "weights"
+PERSON_WEIGHTS = str(_WEIGHTS_DIR / "yolo11m.pt")
 
 
 def _token() -> str | None:
@@ -36,11 +37,22 @@ def _download(repo_id: str, filename: str) -> str:
 
 
 def get_person_model() -> YOLO:
-    """CrowdHuman YOLOv8n — dedicated person detector (crowds / varied clothing)."""
+    """Local YOLO11m COCO person — stronger recall for full-body / abaya scenes."""
     with _lock:
         if "person" not in _cache:
-            path = _download(PERSON_REPO, PERSON_FILE)
+            path = PERSON_WEIGHTS
+            if not os.path.isfile(path):
+                _WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
+                YOLO("yolo11m.pt")  # downloads to CWD if missing
+                cwd_pt = Path.cwd() / "yolo11m.pt"
+                if cwd_pt.is_file():
+                    import shutil
+
+                    shutil.copy2(cwd_pt, path)
+                else:
+                    path = "yolo11m.pt"
             _cache["person"] = YOLO(path)
+            print(f"[models] person weights: {path}")
         return _cache["person"]
 
 
@@ -69,7 +81,7 @@ def preload_models() -> None:
     """Warm caches in background so first UI click is faster."""
     try:
         get_person_model()
-        print("[preload] person (CrowdHuman) ready")
+        print("[preload] person (YOLO11m local) ready")
     except Exception as exc:  # noqa: BLE001
         print(f"[preload] person failed: {exc}")
     try:
